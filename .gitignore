@@ -1,0 +1,23 @@
+# node
+frontend/node_modules/
+frontend/.svelte-kit/
+frontend/build/
+frontend/.vite/
+
+# python
+backend/.venv/
+__pycache__/
+*.pyc
+
+# local runtime data
+backend/storage/
+storage/
+
+# env + secrets
+.env
+backend/.env
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/

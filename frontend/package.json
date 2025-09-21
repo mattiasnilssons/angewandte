@@ -1,0 +1,20 @@
+{
+  "name": "pdf-ai-search-frontend",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-auto": "^6.1.0",
+    "@sveltejs/kit": "2.7.2",
+    "@sveltejs/vite-plugin-svelte": "3.1.2",
+    "svelte": "4.2.18",
+    "svelte-preprocess": "^6.0.3",
+    "typescript": "5.6.2",
+    "vite": "5.4.6"
+  }
+}

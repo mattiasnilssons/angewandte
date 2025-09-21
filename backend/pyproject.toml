@@ -1,0 +1,39 @@
+[tool.poetry]
+name = "pdf-ai-search-backend"
+version = "0.1.0"
+description = "FastAPI + FAISS RAG backend for AI search in PDFs"
+authors = ["Mattias Nilsson <gusinikima@student.gu.se>"]
+readme = "README.md"
+package-mode = true
+
+# tell Poetry where your code package lives
+packages = [{ include = "backend", from = ".." }]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+
+fastapi = "0.112.0"
+uvicorn = {version = "0.30.6", extras = ["standard"]}
+python-multipart = "0.0.9"
+SQLAlchemy = "2.0.35"
+pydantic = "2.9.2"
+pydantic-settings = "2.5.2"
+sentence-transformers = "3.0.1"
+faiss-cpu = "1.8.0.post1"
+PyMuPDF = "1.24.10"
+pdfminer-six = "20231228"
+numpy = "1.26.4"
+openai = "1.108.1"
+transformers = "4.56.1" # optional pin to speed up resolver
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.2.0"
+httpx = "^0.28.1"
+
+[tool.poetry.scripts]
+api = "backend.__main__:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
