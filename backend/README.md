@@ -1,20 +1,25 @@
 
 # Backend (FastAPI)
 
-## Quickstart
-```bash
-cd backend
-python -m venv .venv && source .venv/bin/activate  # on Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-
-# optional: copy .env.example to .env and edit
-cp .env.example .env
-
-# run
-uvicorn app:app --reload
+## Quickstart (Poetry)
+from the repo root, then: 
 ```
+cd backend
+```
+if you don't have Poetry yet:
+```
+curl -sSL https://install.python-poetry.org | python3 -
 
-The API will be at `http://localhost:8000`. Docs at `http://localhost:8000/docs`.
+poetry install            # installs all deps into a Poetry venv
+poetry run python -m pip install --upgrade pip setuptools wheel  # optional
+
+# env
+cp .env.example .env      # then edit .env (API keys, etc.)
+
+# run the API (either form works)
+poetry run uvicorn backend.app:app --reload
+# or, if you kept the script in pyproject.toml:
+# poetry run api
 
 ## Environment (.env)
 ```
