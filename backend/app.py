@@ -8,6 +8,9 @@ from pathlib import Path
 import shutil, os, numpy as np
 from pydantic import BaseModel
 from openai import OpenAI
+import hashlib
+from datetime import datetime
+import fitz  # PyMuPDF
 
 from .settings import settings
 from .db import Base, engine, get_db
@@ -20,6 +23,35 @@ app = FastAPI(title="PDF AI Search API", version="0.1.0")
 
 # Create DB tables
 Base.metadata.create_all(bind=engine)
+
+
+def read_pdf_meta(path: Path) -> dict:
+    meta = {}
+    try:
+        with fitz.open(str(path)) as doc:
+            info = doc.metadata or {}
+            meta = {
+                "title": info.get("title"),
+                "author": info.get("author"),
+                "subject": info.get("subject"),
+                "keywords": info.get("keywords"),
+                "creator": info.get("creator"),
+                "producer": info.get("producer"),
+                "creationDate": info.get("creationDate"),
+                "modDate": info.get("modDate"),
+                "pages": doc.page_count,
+            }
+    except Exception:
+        # best-effort; don't crash if a file has odd metadata
+        meta = {}
+    try:
+        stat = path.stat()
+        meta["file_size"] = stat.st_size
+        meta["file_size_mb"] = round(stat.st_size / (1024 * 1024), 2)
+        meta["mtime"] = datetime.fromtimestamp(stat.st_mtime).isoformat()
+    except Exception:
+        pass
+    return meta
 
 
 class AskRequest(BaseModel):
@@ -59,34 +91,64 @@ def config_status():
     }
 
 
+def _sha256_of_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
 @app.post("/api/upload")
 async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
-    # Save file
+
+    # Save temp then hash
     dest = settings.DATA_DIR / "docs" / file.filename
     with open(dest, "wb") as f:
         shutil.copyfileobj(file.file, f)
-    # Extract text
+
+    sha = _sha256_of_file(dest)
+
+    # If this file is already indexed, just return info and DO NOT re-index
+    existing = db.query(Document).filter(Document.sha256 == sha).first()
+    if existing:
+        return {
+            "document_id": existing.id,
+            "filename": existing.filename,
+            "pages": existing.pages,
+            "chunks_indexed": db.query(Chunk).filter(Chunk.document_id == existing.id).count(),
+            "note": "Duplicate file detected by SHA-256; using existing index."
+        }
+
+    # Otherwise extract & index as before...
     pages = extract_text_from_pdf(dest)
     pages_clean = [(pno, clean_text(txt)) for pno, txt in pages]
-    # Save document
-    doc = Document(filename=file.filename, title=file.filename, path=str(dest), pages=len(pages_clean))
+
+    doc = Document(
+        filename=file.filename,
+        title=file.filename,
+        path=str(dest),
+        pages=len(pages_clean),
+        sha256=sha
+    )
     db.add(doc); db.commit(); db.refresh(doc)
 
-    # Chunk + record
     all_chunks: List[Chunk] = []
     for pno, text in pages_clean:
-        for ci, (start, end, ctext) in enumerate(chunk_text_with_overlap(text, settings.CHUNK_SIZE, settings.CHUNK_OVERLAP)):
-            ch = Chunk(document_id=doc.id, chunk_index=ci, text=ctext, page=pno, start_char=start, end_char=end)
-            all_chunks.append(ch)
-    db.add_all(all_chunks)
-    db.commit()
+        for ci, (start, end, ctext) in enumerate(
+            chunk_text_with_overlap(text, settings.CHUNK_SIZE, settings.CHUNK_OVERLAP)
+        ):
+            all_chunks.append(
+                Chunk(
+                    document_id=doc.id, chunk_index=ci, text=ctext,
+                    page=pno, start_char=start, end_char=end
+                )
+            )
+    db.add_all(all_chunks); db.commit()
 
-    # Embed + index
     texts = [c.text for c in all_chunks]
     vectors = get_emb().embed_documents(texts)
-    # normalize for cosine
     norms = np.linalg.norm(vectors, axis=1, keepdims=True) + 1e-12
     vectors = vectors / norms
     chunk_ids = [c.id for c in all_chunks]
@@ -96,33 +158,48 @@ async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)
         "document_id": doc.id,
         "filename": doc.filename,
         "pages": doc.pages,
-        "chunks_indexed": len(all_chunks)
+        "chunks_indexed": len(all_chunks),
+        "meta": read_pdf_meta(Path(doc.path))
     }
 
 @app.get("/api/documents")
-def list_documents(db: Session = Depends(get_db)):
+def list_documents(include_meta: bool = True, db: Session = Depends(get_db)):
     docs = db.query(Document).order_by(Document.uploaded_at.desc()).all()
-    return [{"id": d.id, "filename": d.filename, "title": d.title, "pages": d.pages, "uploaded_at": d.uploaded_at} for d in docs]
+    out = []
+    for d in docs:
+        item = {
+            "id": d.id,
+            "filename": d.filename,
+            "title": d.title,
+            "pages": d.pages,
+            "uploaded_at": d.uploaded_at,
+        }
+        if include_meta:
+            item["meta"] = read_pdf_meta(Path(d.path))
+        out.append(item)
+    return out
 
-
-from collections import defaultdict
 
 @app.get("/api/search")
 def search(q: str = Query(..., min_length=2), top_k: int = 8, db: Session = Depends(get_db)):
     if faiss_index.index.ntotal == 0:
         return {"results": [], "note": "Index is empty. Upload PDFs first."}
 
+    # embed + normalize
     qv = get_emb().embed_query(q)
     qv = qv / (np.linalg.norm(qv) + 1e-12)
 
-    fetch_k = max(top_k * 10, 50)  # over-fetch to allow dedupe
+    # over-fetch to allow de-duplication
+    fetch_k = max(top_k * 10, 50)
     D, I = faiss_index.search(qv, top_k=fetch_k)
 
-    seen_vector_ids = set()
-    best_by_page: dict[tuple[str,int], dict] = {}  # (doc_id, page) -> result
+    seen_vector_ids: set[int] = set()
+    best_by_filepage: dict[tuple[str, int], dict] = {}
 
-    for score, fid in zip(D.flatten().tolist(), I.flatten().tolist()):
-        if fid is None or fid == -1 or fid in seen_vector_ids:
+    for score, fid in zip(np.array(D).flatten().tolist(), np.array(I).flatten().tolist()):
+        if fid is None or fid == -1:
+            continue
+        if fid in seen_vector_ids:
             continue
         seen_vector_ids.add(fid)
 
@@ -136,22 +213,24 @@ def search(q: str = Query(..., min_length=2), top_k: int = 8, db: Session = Depe
         if not doc:
             continue
 
-        key = (doc.id, chunk.page)
-        snippet = chunk.text[:400] + ("..." if len(chunk.text) > 400 else "")
+        key = (doc.filename, int(chunk.page or 0))  # <— dedupe by filename + page
+        snippet = (chunk.text or "")[:400] + ("..." if chunk.text and len(chunk.text) > 400 else "")
+
         item = {
             "score": float(score),
             "chunk_id": chunk.id,
-            "page": chunk.page,
+            "page": int(chunk.page or 0),
             "document": {"id": doc.id, "title": doc.title, "filename": doc.filename},
             "snippet": snippet
         }
 
-        prev = best_by_page.get(key)
+        prev = best_by_filepage.get(key)
         if (prev is None) or (item["score"] > prev["score"]):
-            best_by_page[key] = item
+            best_by_filepage[key] = item
 
-    results = sorted(best_by_page.values(), key=lambda r: r["score"], reverse=True)[:top_k]
+    results = sorted(best_by_filepage.values(), key=lambda r: r["score"], reverse=True)[:top_k]
     return {"results": results}
+
 
 @app.post("/api/ask")
 async def ask(req: AskRequest, db: Session = Depends(get_db)):
@@ -219,3 +298,40 @@ async def ask(req: AskRequest, db: Session = Depends(get_db)):
     answer = resp.choices[0].message.content
     return {"answer": answer, "contexts": contexts}
 
+@app.delete("/api/documents/{doc_id}")
+def delete_document(doc_id: str, db: Session = Depends(get_db)):
+    # 1) find doc
+    doc = db.query(Document).filter(Document.id == doc_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # 2) collect vectors for this doc (via chunks -> faiss_map)
+    chunks = db.query(Chunk).filter(Chunk.document_id == doc_id).all()
+    chunk_ids = {c.id for c in chunks}
+    maps = db.query(FaissMap).filter(FaissMap.chunk_id.in_(chunk_ids)).all()
+    vector_ids = [m.vector_id for m in maps]
+
+    # 3) try to remove vectors from FAISS
+    try:
+        _ = faiss_index.remove_vector_ids(vector_ids)
+    except Exception:
+        pass  # fail-safe
+
+    # 4) delete mapping rows
+    if maps:
+        for m in maps:
+            db.delete(m)
+
+    # 5) delete chunks and doc (cascades if configured)
+    for c in chunks:
+        db.delete(c)
+    db.delete(doc)
+    db.commit()
+
+    # 6) delete file on disk
+    try:
+        Path(doc.path).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    return {"ok": True, "deleted_vectors": len(vector_ids), "deleted_chunks": len(chunks)}

@@ -10,13 +10,15 @@ def gen_uuid():
 class Document(Base):
     __tablename__ = "documents"
     id = Column(String, primary_key=True, default=gen_uuid)
-    filename = Column(String, nullable=False, unique=True)  # <— unique
+    filename = Column(String, nullable=False, index=True)
     title = Column(String, nullable=True)
     path = Column(String, nullable=False)
     pages = Column(Integer, default=0)
     uploaded_at = Column(DateTime, default=datetime.utcnow)
+    sha256 = Column(String, unique=True, index=True)  # <— new
 
     chunks = relationship("Chunk", back_populates="document", cascade="all, delete-orphan")
+
 
 class Chunk(Base):
     __tablename__ = "chunks"

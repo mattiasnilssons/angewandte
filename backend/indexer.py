@@ -46,3 +46,28 @@ class FaissIndex:
             query_vec = query_vec[None, :]
         D, I = self.index.search(query_vec, top_k)
         return D[0], I[0]
+
+    def remove_vector_ids(self, vector_ids: list[int]) -> int:
+        """
+        Try to remove by vector_id (the 'row id' we stored in FaissMap).
+        Works only if the underlying index supports remove_ids.
+        Returns number of removed ids (best effort).
+        """
+        if not vector_ids:
+            return 0
+        if hasattr(self.index, "remove_ids"):
+            try:
+                arr = np.array(vector_ids, dtype=np.int64)
+                # Many FAISS variants accept an IDSelector or numpy array
+                removed = self.index.remove_ids(arr)
+                # removed is a faiss IDSelector or count depending on version;
+                # normalize to int when possible:
+                try:
+                    return int(removed)
+                except Exception:
+                    return len(vector_ids)
+            except Exception:
+                # If remove failed, we just leave them orphaned.
+                return 0
+        # No support for removal → do nothing (orphan approach)
+        return 0
