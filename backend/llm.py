@@ -4,11 +4,13 @@ from .settings import settings  # make sure this has OPENAI_API_KEY
 
 _client = None
 
+
 def client():
     global _client
     if _client is None:
         _client = OpenAI(api_key=settings.OPENAI_API_KEY)
     return _client
+
 
 def generate_answer(question: str, contexts: list[dict]) -> str:
     """
@@ -38,7 +40,9 @@ def generate_answer(question: str, contexts: list[dict]) -> str:
 
     resp = client().responses.create(
         model="gpt-5-nano",
-        input=[{"role":"system","content":system},
-               {"role":"user","content":user}]
+        input=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
     )
     return resp.output_text

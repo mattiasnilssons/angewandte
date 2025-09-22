@@ -6,9 +6,11 @@ from pathlib import Path
 BASE_DIR = Path(__file__).parent.resolve()
 DEFAULT_STORAGE = BASE_DIR / "storage"
 
+
 def _sqlite_url(path: Path) -> str:
     # Ensure absolute sqlite URL
     return f"sqlite:///{path.resolve().as_posix()}"
+
 
 class Settings(BaseSettings):
     # Storage (absolute, under backend/storage)
@@ -37,6 +39,7 @@ class Settings(BaseSettings):
         # Read .env from backend/.env no matter where we start
         env_file = BASE_DIR / ".env"
         case_sensitive = False
+
 
 settings = Settings()
 

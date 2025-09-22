@@ -25,6 +25,7 @@ pdfminer-six = "20231228"
 numpy = "1.26.4"
 openai = "1.108.1"
 transformers = "4.56.1" # optional pin to speed up resolver
+black = "^25.9.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.2.0"

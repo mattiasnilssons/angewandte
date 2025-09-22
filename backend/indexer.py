@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 from pathlib import Path
 from typing import List, Tuple
@@ -6,6 +5,7 @@ import faiss, numpy as np
 from sqlalchemy.orm import Session
 from .settings import settings
 from .models import FaissMap, Chunk
+
 
 class FaissIndex:
     def __init__(self, index_path: Path):
@@ -19,14 +19,18 @@ class FaissIndex:
                 self._index = faiss.read_index(str(self.index_path))
             else:
                 # Use cosine similarity via inner product on normalized vectors
-                self._index = faiss.IndexFlatIP(384)  # default dimension for MiniLM; will work for OpenAI small (1536) if rebuilt
+                self._index = faiss.IndexFlatIP(
+                    384
+                )  # default dimension for MiniLM; will work for OpenAI small (1536) if rebuilt
         return self._index
 
     def save(self):
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
         faiss.write_index(self.index, str(self.index_path))
 
-    def add_vectors(self, db: Session, chunk_ids: List[str], vectors: np.ndarray) -> List[int]:
+    def add_vectors(
+        self, db: Session, chunk_ids: List[str], vectors: np.ndarray
+    ) -> List[int]:
         # If index is empty with wrong dimension, rebuild with correct dim
         if self.index.ntotal == 0 and self.index.d != vectors.shape[1]:
             self._index = faiss.IndexFlatIP(vectors.shape[1])
@@ -40,7 +44,9 @@ class FaissIndex:
         db.commit()
         return ids
 
-    def search(self, query_vec: np.ndarray, top_k: int = 5) -> Tuple[np.ndarray, np.ndarray]:
+    def search(
+        self, query_vec: np.ndarray, top_k: int = 5
+    ) -> Tuple[np.ndarray, np.ndarray]:
         query_vec = np.asarray(query_vec, dtype=np.float32)
         if query_vec.ndim == 1:
             query_vec = query_vec[None, :]

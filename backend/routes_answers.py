@@ -6,9 +6,11 @@ from .search import retrieve_top_k  # your existing vector search
 
 router = APIRouter()
 
+
 class AskBody(BaseModel):
     question: str
     k: int = 6
+
 
 @router.post("/answer")
 def answer(body: AskBody):
@@ -25,5 +27,5 @@ def answer(body: AskBody):
         # preserve your earlier debug output if you want
         return {
             "answer": f"LLM not configured ({e}). Here are the top contexts:",
-            "contexts": contexts
+            "contexts": contexts,
         }
