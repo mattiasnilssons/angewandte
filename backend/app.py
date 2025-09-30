@@ -1,4 +1,6 @@
 from __future__ import annotations
+# at top with other imports
+from fastapi.responses import FileResponse
 
 import hashlib
 import json
@@ -6,7 +8,7 @@ import numpy as np
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 import fitz  # PyMuPDF
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, Query
@@ -22,6 +24,8 @@ from .models import Document, Chunk, FaissMap
 from .processing import extract_text_from_pdf, clean_text, get_pdf_metadata, chunk_text_with_overlap
 
 from .settings import settings
+from fastapi import Body
+import re
 
 app = FastAPI(title="PDF AI Search API", version="0.1.0")
 
@@ -85,6 +89,28 @@ def get_emb():
     return emb
 
 
+@app.get("/api/documents/{doc_id}/download")
+def download_document(doc_id: str, db: Session = Depends(get_db)):
+    """
+    Stream the original PDF back to the browser.
+    """
+    doc = db.query(Document).filter(Document.id == doc_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    path = Path(doc.path)
+    # basic safety & existence checks
+    if not path.is_file() or path.suffix.lower() != ".pdf":
+        raise HTTPException(status_code=404, detail="File not found on disk")
+
+    # Return with a friendly filename; forces download in most browsers
+    return FileResponse(
+        path=path,
+        media_type="application/pdf",
+        filename=doc.filename,  # Content-Disposition
+    )
+
+
 @app.get("/api/config_status")
 def config_status():
     return {
@@ -143,7 +169,7 @@ async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)
 
     # Read PDF metadata
     pdf_meta = get_pdf_metadata(dest)
-    author = pdf_meta.get("author")
+    author = pdf_meta.get("author") or guess_author_from_pages(pages_clean)
     year = pdf_meta.get("year")
 
     # Create Document row
@@ -154,12 +180,13 @@ async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)
         year=year,
         meta_json=json.dumps({
             **pdf_meta,
+            "guessed_author": author if not pdf_meta.get("author") else None,
             "file_size": dest.stat().st_size,
             "file_size_mb": round(dest.stat().st_size / (1024 * 1024), 2),
         }),
         path=str(dest),
         pages=len(pages_clean),
-        sha256=sha,  # store the hash so future duplicates are skipped
+        sha256=sha,
     )
     db.add(doc)
     db.commit()
@@ -208,6 +235,8 @@ async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)
 
 
 
+
+
 @app.get("/api/documents")
 def list_documents(include_meta: bool = True, db: Session = Depends(get_db)):
     docs = db.query(Document).order_by(Document.uploaded_at.desc()).all()
@@ -217,13 +246,28 @@ def list_documents(include_meta: bool = True, db: Session = Depends(get_db)):
             "id": d.id,
             "filename": d.filename,
             "title": d.title,
+            "author": d.author,
+            "year": d.year,
             "pages": d.pages,
             "uploaded_at": d.uploaded_at,
         }
         if include_meta:
-            item["meta"] = read_pdf_meta(Path(d.path))
+            # Prefer meta stored in DB; fallback to file meta if empty
+            stored = {}
+            try:
+                stored = json.loads(d.meta_json or "{}")
+            except Exception:
+                stored = {}
+            if not stored:
+                stored = read_pdf_meta(Path(d.path)) or {}
+            # Normalize convenient fields for the UI
+            stored.setdefault("title", d.title)
+            stored.setdefault("author", d.author)
+            stored.setdefault("pages", d.pages)
+            item["meta"] = stored
         out.append(item)
     return out
+
 
 
 @app.get("/api/search")
@@ -363,44 +407,117 @@ async def ask(req: AskRequest, db: Session = Depends(get_db)):
     return {"answer": answer, "contexts": contexts}
 
 
-@app.delete("/api/documents/{doc_id}")
-def delete_document(doc_id: str, db: Session = Depends(get_db)):
-    # 1) find doc
+
+@app.patch("/api/documents/{doc_id}")
+def update_document_meta(
+    doc_id: str,
+    payload: Dict[str, Any] = Body(...),
+    db: Session = Depends(get_db),
+):
+    """
+    JSON body can contain:
+    {
+      "title": "New title",       # optional
+      "author": "New author",     # optional
+      "year": 2005,               # optional (int)
+      "meta": { ... }             # optional dict, merged into meta_json
+    }
+    """
     doc = db.query(Document).filter(Document.id == doc_id).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    # 2) collect vectors for this doc (via chunks -> faiss_map)
-    chunks = db.query(Chunk).filter(Chunk.document_id == doc_id).all()
-    chunk_ids = {c.id for c in chunks}
-    maps = db.query(FaissMap).filter(FaissMap.chunk_id.in_(chunk_ids)).all()
-    vector_ids = [m.vector_id for m in maps]
+    changed = False
 
-    # 3) try to remove vectors from FAISS
+    title = payload.get("title")
+    author = payload.get("author")
+    year = payload.get("year")
+    extra_meta = payload.get("meta")
+
+    if title is not None and title != doc.title:
+        doc.title = title
+        changed = True
+    if author is not None and author != doc.author:
+        doc.author = author
+        changed = True
+    if year is not None and year != doc.year:
+        try:
+            doc.year = int(year)
+        except Exception:
+            raise HTTPException(status_code=400, detail="year must be an integer")
+        changed = True
+
+    if extra_meta and isinstance(extra_meta, dict):
+        current = {}
+        try:
+            current = json.loads(doc.meta_json or "{}")
+        except Exception:
+            current = {}
+        current.update(extra_meta)
+        doc.meta_json = json.dumps(current)
+        changed = True
+
+    if changed:
+        db.add(doc)
+        db.commit()
+        db.refresh(doc)
+
+    # Return the same shape as list_documents (for easy UI refresh)
+    meta = {}
     try:
-        _ = faiss_index.remove_vector_ids(vector_ids)
+        meta = json.loads(doc.meta_json or "{}")
     except Exception:
-        pass  # fail-safe
-
-    # 4) delete mapping rows
-    if maps:
-        for m in maps:
-            db.delete(m)
-
-    # 5) delete chunks and doc (cascades if configured)
-    for c in chunks:
-        db.delete(c)
-    db.delete(doc)
-    db.commit()
-
-    # 6) delete file on disk
-    try:
-        Path(doc.path).unlink(missing_ok=True)
-    except Exception:
-        pass
+        meta = {}
+    meta.setdefault("title", doc.title)
+    meta.setdefault("author", doc.author)
+    meta.setdefault("pages", doc.pages)
 
     return {
         "ok": True,
-        "deleted_vectors": len(vector_ids),
-        "deleted_chunks": len(chunks),
+        "document": {
+            "id": doc.id,
+            "filename": doc.filename,
+            "title": doc.title,
+            "author": doc.author,
+            "year": doc.year,
+            "pages": doc.pages,
+            "uploaded_at": doc.uploaded_at,
+            "meta": meta,
+        },
     }
+
+
+NAME_RE = re.compile(r"\b([A-ZÄÖÜ][a-zäöüß]+(?:[-\s][A-ZÄÖÜ][a-zäöüß]+){0,2})\b")
+
+def guess_author_from_pages(pages_clean) -> str | None:
+    """
+    Very lightweight heuristic:
+    - Scan first page lines
+    - Prefer lines following cues like 'Autor', 'Author', 'by', 'von'
+    - Otherwise pick a plausible capitalized name near the bottom half
+    """
+    if not pages_clean:
+        return None
+
+    page_no, text = pages_clean[0]
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    cues = ("autor", "author", "by", "von")
+
+    # 1) cue-based search
+    for i, ln in enumerate(lines):
+        low = ln.lower()
+        if any(c in low for c in cues):
+            # try this line or the next line for a name
+            for candidate in (ln, lines[i+1] if i+1 < len(lines) else ""):
+                m = NAME_RE.search(candidate)
+                if m:
+                    return m.group(1)
+
+    # 2) generic name-looking line from bottom half of the page
+    half = len(lines) // 2
+    for ln in lines[half:]:
+        m = NAME_RE.search(ln)
+        if m:
+            return m.group(1)
+
+    return None
