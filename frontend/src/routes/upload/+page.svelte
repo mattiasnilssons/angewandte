@@ -298,7 +298,7 @@ Tag-File-Character-Encoding: UTF-8`;
 </div>
 
 <div class="card" style="margin-top:16px;">
-    <h2>My documents</h2>
+    <h2>Overview of Diploma Theses</h2>
     {#if loadingDocs}
         <p class="small">Loading…</p>
     {:else if !docs.length}

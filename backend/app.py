@@ -1,18 +1,18 @@
 from __future__ import annotations
-# at top with other imports
-from fastapi.responses import FileResponse
 
 import hashlib
 import json
 import numpy as np
+import re
 import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 import fitz  # PyMuPDF
-from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from openai import OpenAI
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -21,52 +21,26 @@ from .db import Base, engine, get_db
 from .embeddings import get_embeddings
 from .indexer import FaissIndex
 from .models import Document, Chunk, FaissMap
-from .processing import extract_text_from_pdf, clean_text, get_pdf_metadata, chunk_text_with_overlap
-
+from .processing import (
+    extract_text_from_pdf,
+    clean_text,
+    get_pdf_metadata,
+    chunk_text_with_overlap,
+)
 from .settings import settings
-from fastapi import Body
-import re
-
-app = FastAPI(title="PDF AI Search API", version="0.1.0")
-
-# Create DB tables
-Base.metadata.create_all(bind=engine)
-
-
-def read_pdf_meta(path: Path) -> dict:
-    meta = {}
-    try:
-        with fitz.open(str(path)) as doc:
-            info = doc.metadata or {}
-            meta = {
-                "title": info.get("title"),
-                "author": info.get("author"),
-                "subject": info.get("subject"),
-                "keywords": info.get("keywords"),
-                "creator": info.get("creator"),
-                "producer": info.get("producer"),
-                "creationDate": info.get("creationDate"),
-                "modDate": info.get("modDate"),
-                "pages": doc.page_count,
-            }
-    except Exception:
-        # best-effort; don't crash if a file has odd metadata
-        meta = {}
-    try:
-        stat = path.stat()
-        meta["file_size"] = stat.st_size
-        meta["file_size_mb"] = round(stat.st_size / (1024 * 1024), 2)
-        meta["mtime"] = datetime.fromtimestamp(stat.st_mtime).isoformat()
-    except Exception:
-        pass
-    return meta
 
 
 class AskRequest(BaseModel):
     question: str
     top_k: int = 8
     personality: Optional[List[str]] = None
+    history: Optional[List[Dict[str, str]]] = None
 
+
+app = FastAPI(title="PDF AI Search API", version="0.1.0")
+
+# Create DB tables
+Base.metadata.create_all(bind=engine)
 
 # CORS
 origins = [o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip()]
@@ -89,26 +63,40 @@ def get_emb():
     return emb
 
 
-@app.get("/api/documents/{doc_id}/download")
-def download_document(doc_id: str, db: Session = Depends(get_db)):
-    """
-    Stream the original PDF back to the browser.
-    """
-    doc = db.query(Document).filter(Document.id == doc_id).first()
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
+def read_pdf_meta(path: Path) -> dict:
+    meta = {}
+    try:
+        with fitz.open(str(path)) as doc:
+            info = doc.metadata or {}
+            meta = {
+                "title": info.get("title"),
+                "author": info.get("author"),
+                "subject": info.get("subject"),
+                "keywords": info.get("keywords"),
+                "creator": info.get("creator"),
+                "producer": info.get("producer"),
+                "creationDate": info.get("creationDate"),
+                "modDate": info.get("modDate"),
+                "pages": doc.page_count,
+            }
+    except Exception:
+        meta = {}
+    try:
+        stat = path.stat()
+        meta["file_size"] = stat.st_size
+        meta["file_size_mb"] = round(stat.st_size / (1024 * 1024), 2)
+        meta["mtime"] = datetime.fromtimestamp(stat.st_mtime).isoformat()
+    except Exception:
+        pass
+    return meta
 
-    path = Path(doc.path)
-    # basic safety & existence checks
-    if not path.is_file() or path.suffix.lower() != ".pdf":
-        raise HTTPException(status_code=404, detail="File not found on disk")
 
-    # Return with a friendly filename; forces download in most browsers
-    return FileResponse(
-        path=path,
-        media_type="application/pdf",
-        filename=doc.filename,  # Content-Disposition
-    )
+def _sha256_of_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 @app.get("/api/config_status")
@@ -127,12 +115,21 @@ def config_status():
     }
 
 
-def _sha256_of_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
+@app.get("/api/documents/{doc_id}/download")
+def download_document(doc_id: str, db: Session = Depends(get_db)):
+    doc = db.query(Document).filter(Document.id == doc_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    path = Path(doc.path)
+    if not path.is_file() or path.suffix.lower() != ".pdf":
+        raise HTTPException(status_code=404, detail="File not found on disk")
+
+    return FileResponse(
+        path=path,
+        media_type="application/pdf",
+        filename=doc.filename,
+    )
 
 
 @app.post("/api/upload")
@@ -148,7 +145,6 @@ async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)
 
     # Hash to detect duplicates
     sha = _sha256_of_file(dest)
-
     existing = db.query(Document).filter(Document.sha256 == sha).first()
     if existing:
         return {
@@ -158,16 +154,18 @@ async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)
             "author": getattr(existing, "author", None),
             "year": getattr(existing, "year", None),
             "pages": existing.pages,
-            "chunks_indexed": db.query(Chunk).filter(Chunk.document_id == existing.id).count(),
+            "chunks_indexed": db.query(Chunk)
+            .filter(Chunk.document_id == existing.id)
+            .count(),
             "meta": json.loads(getattr(existing, "meta_json", "") or "{}"),
-            "note": "Duplicate file detected by SHA-256; using existing index."
+            "note": "Duplicate file detected by SHA-256; using existing index.",
         }
 
     # Extract page texts
     pages = extract_text_from_pdf(dest)
     pages_clean = [(pno, clean_text(txt)) for pno, txt in pages]
 
-    # Read PDF metadata
+    # Read PDF metadata + light author guess
     pdf_meta = get_pdf_metadata(dest)
     author = pdf_meta.get("author") or guess_author_from_pages(pages_clean)
     year = pdf_meta.get("year")
@@ -178,12 +176,14 @@ async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)
         title=pdf_meta.get("title") or file.filename,
         author=author,
         year=year,
-        meta_json=json.dumps({
-            **pdf_meta,
-            "guessed_author": author if not pdf_meta.get("author") else None,
-            "file_size": dest.stat().st_size,
-            "file_size_mb": round(dest.stat().st_size / (1024 * 1024), 2),
-        }),
+        meta_json=json.dumps(
+            {
+                **pdf_meta,
+                "guessed_author": author if not pdf_meta.get("author") else None,
+                "file_size": dest.stat().st_size,
+                "file_size_mb": round(dest.stat().st_size / (1024 * 1024), 2),
+            }
+        ),
         path=str(dest),
         pages=len(pages_clean),
         sha256=sha,
@@ -234,9 +234,6 @@ async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)
     }
 
 
-
-
-
 @app.get("/api/documents")
 def list_documents(include_meta: bool = True, db: Session = Depends(get_db)):
     docs = db.query(Document).order_by(Document.uploaded_at.desc()).all()
@@ -252,7 +249,6 @@ def list_documents(include_meta: bool = True, db: Session = Depends(get_db)):
             "uploaded_at": d.uploaded_at,
         }
         if include_meta:
-            # Prefer meta stored in DB; fallback to file meta if empty
             stored = {}
             try:
                 stored = json.loads(d.meta_json or "{}")
@@ -260,7 +256,6 @@ def list_documents(include_meta: bool = True, db: Session = Depends(get_db)):
                 stored = {}
             if not stored:
                 stored = read_pdf_meta(Path(d.path)) or {}
-            # Normalize convenient fields for the UI
             stored.setdefault("title", d.title)
             stored.setdefault("author", d.author)
             stored.setdefault("pages", d.pages)
@@ -269,11 +264,8 @@ def list_documents(include_meta: bool = True, db: Session = Depends(get_db)):
     return out
 
 
-
 @app.get("/api/search")
-def search(
-    q: str = Query(..., min_length=2), top_k: int = 8, db: Session = Depends(get_db)
-):
+def search(q: str = Query(..., min_length=2), top_k: int = 8, db: Session = Depends(get_db)):
     if faiss_index.index.ntotal == 0:
         return {"results": [], "note": "Index is empty. Upload PDFs first."}
 
@@ -288,9 +280,7 @@ def search(
     seen_vector_ids: set[int] = set()
     best_by_filepage: dict[tuple[str, int], dict] = {}
 
-    for score, fid in zip(
-        np.array(D).flatten().tolist(), np.array(I).flatten().tolist()
-    ):
+    for score, fid in zip(np.array(D).flatten().tolist(), np.array(I).flatten().tolist()):
         if fid is None or fid == -1:
             continue
         if fid in seen_vector_ids:
@@ -307,10 +297,8 @@ def search(
         if not doc:
             continue
 
-        key = (doc.filename, int(chunk.page or 0))  # <— dedupe by filename + page
-        snippet = (chunk.text or "")[:400] + (
-            "..." if chunk.text and len(chunk.text) > 400 else ""
-        )
+        key = (doc.filename, int(chunk.page or 0))  # dedupe by filename + page
+        snippet = (chunk.text or "")[:400] + ("..." if chunk.text and len(chunk.text) > 400 else "")
 
         item = {
             "score": float(score),
@@ -330,26 +318,22 @@ def search(
         if (prev is None) or (item["score"] > prev["score"]):
             best_by_filepage[key] = item
 
-    results = sorted(best_by_filepage.values(), key=lambda r: r["score"], reverse=True)[
-        :top_k
-    ]
+    results = sorted(best_by_filepage.values(), key=lambda r: r["score"], reverse=True)[:top_k]
     return {"results": results}
 
 
 @app.post("/api/ask")
 async def ask(req: AskRequest, db: Session = Depends(get_db)):
     if faiss_index.index.ntotal == 0:
-        raise HTTPException(
-            status_code=400, detail="Index is empty. Upload PDFs first."
-        )
+        raise HTTPException(status_code=400, detail="Index is empty. Upload PDFs first.")
 
-    # Embed and search
+    # 1) retrieve top-k context for current question
     qv = get_emb().embed_query(req.question)
     qv = qv / (np.linalg.norm(qv) + 1e-12)
     D, I = faiss_index.search(qv, top_k=req.top_k)
 
     contexts = []
-    for fid in I.tolist():
+    for fid in np.array(I).flatten().tolist():
         fmap = db.query(FaissMap).filter(FaissMap.vector_id == int(fid)).first()
         if not fmap:
             continue
@@ -360,67 +344,73 @@ async def ask(req: AskRequest, db: Session = Depends(get_db)):
         contexts.append(f"[{doc.filename} p.{chunk.page}] {chunk.text}")
 
     if not contexts:
-        return {"answer": "No relevant context found.", "contexts": []}
+        return {"answer": "No relevant context found.", "contexts": [], "usage": {}}
 
-    # If LLM not configured → return contexts only
+    # 2) If LLM is not configured, return contexts only
     if settings.LLM_PROVIDER != "openai" or not settings.OPENAI_API_KEY:
         return {
             "answer": "LLM not configured. Showing top contexts only.",
             "contexts": contexts,
+            "usage": {},
         }
 
-    # Build system messages
+    # 3) System messages (personality + guardrails)
     system_msgs = []
     if req.personality:
         for stmt in req.personality:
-            if stmt.strip():
-                system_msgs.append({"role": "system", "content": stmt.strip()})
-    # Default RAG instructions always included
+            s = (stmt or "").strip()
+            if s:
+                system_msgs.append({"role": "system", "content": s})
     system_msgs.append(
         {
             "role": "system",
             "content": (
                 "You are an assistant for a conservation/restoration department. "
-                "Answer the user's question using ONLY the provided context from uploaded PDFs. "
-                "Cite the filename and page in brackets like [filename p.12] when you use a passage. "
+                "Use ONLY the provided context from uploaded PDFs. "
+                "Cite the filename and page like [filename p.12]. "
                 "If the answer isn't in the context, say you don't know."
             ),
         }
     )
 
-    # User message with question + contexts
-    joined = "\n\n----\n\n".join(contexts[: req.top_k])
+    # 4) Prior turns (optional) — sanitize to only user/assistant, cap last 12
+    history_msgs = []
+    for m in (req.history or [])[-12:]:
+        role = m.get("role")
+        if role in ("user", "assistant"):
+            history_msgs.append({"role": role, "content": m.get("content", "")})
+
+    # 5) Current user turn with fresh context
     user_msg = {
         "role": "user",
-        "content": f"Question: {req.question}\n\nContext:\n{joined}",
+        "content": "Question: "
+        + req.question
+        + "\n\nContext:\n"
+        + "\n\n----\n\n".join(contexts[: req.top_k]),
     }
-
-    # Call OpenAI
 
     client = OpenAI(api_key=settings.OPENAI_API_KEY)
     resp = client.chat.completions.create(
         model=settings.OPENAI_CHAT_MODEL,
-        messages=system_msgs + [user_msg],
+        messages=system_msgs + history_msgs + [user_msg],
         temperature=1,
     )
-    answer = resp.choices[0].message.content
-    return {"answer": answer, "contexts": contexts}
-
+    answer = resp.choices[0].message.content or ""
+    usage = getattr(resp, "usage", None) or {}
+    return {"answer": answer, "contexts": contexts, "usage": usage}
 
 
 @app.patch("/api/documents/{doc_id}")
 def update_document_meta(
-    doc_id: str,
-    payload: Dict[str, Any] = Body(...),
-    db: Session = Depends(get_db),
+    doc_id: str, payload: Dict[str, Any] = Body(...), db: Session = Depends(get_db)
 ):
     """
     JSON body can contain:
     {
-      "title": "New title",       # optional
-      "author": "New author",     # optional
-      "year": 2005,               # optional (int)
-      "meta": { ... }             # optional dict, merged into meta_json
+      "title": "New title",   # optional
+      "author": "New author", # optional
+      "year": 2005,           # optional (int)
+      "meta": { ... }         # optional dict, merged into meta_json
     }
     """
     doc = db.query(Document).filter(Document.id == doc_id).first()
@@ -462,7 +452,6 @@ def update_document_meta(
         db.commit()
         db.refresh(doc)
 
-    # Return the same shape as list_documents (for easy UI refresh)
     meta = {}
     try:
         meta = json.loads(doc.meta_json or "{}")
@@ -487,6 +476,8 @@ def update_document_meta(
     }
 
 
+# --- Lightweight author guesser ----------------------------------------------
+
 NAME_RE = re.compile(r"\b([A-ZÄÖÜ][a-zäöüß]+(?:[-\s][A-ZÄÖÜ][a-zäöüß]+){0,2})\b")
 
 def guess_author_from_pages(pages_clean) -> str | None:
@@ -499,7 +490,7 @@ def guess_author_from_pages(pages_clean) -> str | None:
     if not pages_clean:
         return None
 
-    page_no, text = pages_clean[0]
+    _page_no, text = pages_clean[0]
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     cues = ("autor", "author", "by", "von")
 
@@ -507,13 +498,12 @@ def guess_author_from_pages(pages_clean) -> str | None:
     for i, ln in enumerate(lines):
         low = ln.lower()
         if any(c in low for c in cues):
-            # try this line or the next line for a name
-            for candidate in (ln, lines[i+1] if i+1 < len(lines) else ""):
+            for candidate in (ln, lines[i + 1] if i + 1 < len(lines) else ""):
                 m = NAME_RE.search(candidate)
                 if m:
                     return m.group(1)
 
-    # 2) generic name-looking line from bottom half of the page
+    # 2) fallback: try a name-looking line from bottom half
     half = len(lines) // 2
     for ln in lines[half:]:
         m = NAME_RE.search(ln)
